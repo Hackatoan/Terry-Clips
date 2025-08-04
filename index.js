@@ -1,200 +1,263 @@
-const prism = require('prism-media');
-const fs = require('node:fs');
-const { Client, GatewayIntentBits, Collection, ChannelType } = require('discord.js');
-const {
-    joinVoiceChannel,
-    createAudioPlayer,
-    createAudioResource,
-    EndBehaviorType,
-    VoiceReceiver,
-} = require('@discordjs/voice');
-const wav = require('wav');
 require('dotenv').config();
 
-// --- Configuration ---
-const MAX_CLIP_DURATION = 120;
-const DEFAULT_CLIP_DURATION = 30;
-const RECORDING_BUFFER_SECONDS = 30;
-const AUDIO_PACKETS_PER_SECOND = 50; // 20ms packets
-const AUDIO_SAMPLE_RATE = 48000;
+const { Client, GatewayIntentBits } = require('discord.js');
+const { joinVoiceChannel, EndBehaviorType, getVoiceConnection } = require('@discordjs/voice');
+const fs = require('fs');
+const prism = require('prism-media');
+const ffmpeg = require('ffmpeg-static');
+const { spawn } = require('child_process');
 
-// --- Bot Setup ---
 const client = new Client({
-    intents: [
-        GatewayIntentBits.Guilds,
-        GatewayIntentBits.GuildVoiceStates,
-        GatewayIntentBits.GuildMembers,
-    ],
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildVoiceStates,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent,
+  ],
 });
 
-// --- Data Storage ---
-const voiceConnections = new Map();
-const audioBuffers = new Map(); // guild.id -> array of audio chunks
-const recordingSessions = new Map(); // guild.id -> session object
-const lastClips = new Map(); // user.id -> file_path
+// Try mono first to test if slowdown goes away; switch to 2 for stereo if needed
+const CHANNELS = 1;
+const AUDIO_BUFFER_MS = 30000; // 30 seconds buffer
+const BYTES_PER_SAMPLE = 2; // 16-bit PCM
 
-// --- Bot Events ---
+const userBuffers = new Map();
+const listeningConnections = new Set();
+
+function startListening(connection) {
+  if (listeningConnections.has(connection)) {
+    console.log('Already listening on this connection, skipping.');
+    return;
+  }
+  listeningConnections.add(connection);
+
+  const receiver = connection.receiver;
+
+  receiver.speaking.on('start', userId => {
+    console.log(`User started speaking: ${userId}`);
+
+    if (!userBuffers.has(userId)) {
+      userBuffers.set(userId, []);
+    }
+
+    const audioStream = receiver.subscribe(userId, {
+      end: { behavior: EndBehaviorType.Manual }
+    });
+
+    const pcmStream = new prism.opus.Decoder({
+      frameSize: 960,
+      channels: CHANNELS,
+      rate: 48000,
+    });
+
+    audioStream.pipe(pcmStream);
+
+    pcmStream.on('data', chunk => {
+      const buffer = userBuffers.get(userId) || [];
+      buffer.push(chunk);
+
+      let bufferLength = buffer.reduce((acc, cur) => acc + cur.length, 0);
+      const maxBufferSize = 48000 * BYTES_PER_SAMPLE * CHANNELS * (AUDIO_BUFFER_MS / 1000);
+
+      while (bufferLength > maxBufferSize) {
+        const removed = buffer.shift();
+        bufferLength -= removed.length;
+      }
+
+      userBuffers.set(userId, buffer);
+    });
+
+    audioStream.on('end', () => {
+      console.log(`User ${userId} stopped speaking, clearing buffer`);
+      userBuffers.delete(userId);
+    });
+
+    audioStream.on('error', (err) => {
+      console.error(`Audio stream error for user ${userId}:`, err);
+      userBuffers.delete(userId);
+    });
+
+    pcmStream.on('error', (err) => {
+      console.error(`PCM stream error for user ${userId}:`, err);
+      userBuffers.delete(userId);
+    });
+  });
+}
+
+// Mix buffers: same as before, but make sure buffers are mono if CHANNELS=1
+function mixBuffers(buffers) {
+  if (buffers.length === 0) return null;
+
+  const minLength = Math.min(...buffers.map(bufArr => Buffer.concat(bufArr).length));
+  const mixedBuffer = Buffer.alloc(minLength);
+
+  function readSample(buffer, offset) {
+    return buffer.readInt16LE(offset);
+  }
+  function writeSample(buffer, offset, sample) {
+    if (sample > 32767) sample = 32767;
+    else if (sample < -32768) sample = -32768;
+    buffer.writeInt16LE(sample, offset);
+  }
+
+  for (let i = 0; i < minLength; i += 2) {
+    let sum = 0;
+    for (const bufArr of buffers) {
+      const combined = Buffer.concat(bufArr);
+      sum += readSample(combined, i);
+    }
+    const avg = sum / buffers.length;
+    writeSample(mixedBuffer, i, avg);
+  }
+
+  return mixedBuffer;
+}
+
+async function sendWavFromMixedBuffer(message, mixedBuffer) {
+  const filename = `clips/mixed-${Date.now()}.wav`;
+  fs.mkdirSync('clips', { recursive: true });
+
+  const ffmpegProcess = spawn(ffmpeg, [
+    '-f', 's16le',
+    '-ar', '48000',
+    '-ac', String(CHANNELS),
+    '-i', 'pipe:0',
+    filename,
+  ]);
+
+  ffmpegProcess.stdin.write(mixedBuffer);
+  ffmpegProcess.stdin.end();
+
+  return new Promise((resolve, reject) => {
+    ffmpegProcess.on('close', (code) => {
+      if (code === 0) {
+        console.log(`Saved mixed clip as ${filename}`);
+        message.channel.send({ files: [filename] });
+        resolve();
+      } else {
+        message.reply('Failed to save mixed audio clip.');
+        reject(new Error(`ffmpeg exited with code ${code}`));
+      }
+    });
+  });
+}
+
+async function sendWavFromBuffer(message, bufferChunks, username) {
+  const filename = `clips/${username}-${Date.now()}.wav`;
+  fs.mkdirSync('clips', { recursive: true });
+
+  const ffmpegProcess = spawn(ffmpeg, [
+    '-f', 's16le',
+    '-ar', '48000',
+    '-ac', String(CHANNELS),
+    '-i', 'pipe:0',
+    filename,
+  ]);
+
+  const combinedBuffer = Buffer.concat(bufferChunks);
+  ffmpegProcess.stdin.write(combinedBuffer);
+  ffmpegProcess.stdin.end();
+
+  return new Promise((resolve, reject) => {
+    ffmpegProcess.on('close', (code) => {
+      if (code === 0) {
+        console.log(`Saved individual clip as ${filename}`);
+        message.channel.send({ files: [filename] });
+        resolve();
+      } else {
+        message.reply(`Failed to save audio clip for ${username}.`);
+        reject(new Error(`ffmpeg exited with code ${code}`));
+      }
+    });
+  });
+}
+
+
 client.once('ready', async () => {
-    console.log(`Logged in as ${client.user.tag}! 🚀`);
-    await autoJoinVC();
+  console.log(`Logged in as ${client.user.tag}`);
+
+  for (const [guildId, guild] of client.guilds.cache) {
+    await guild.fetch();
+    const voiceChannels = guild.channels.cache.filter(c => c.type === 2);
+
+    for (const [, channel] of voiceChannels) {
+      if (channel.members.size > 0) {
+        const connection = joinVoiceChannel({
+          channelId: channel.id,
+          guildId: guild.id,
+          adapterCreator: guild.voiceAdapterCreator,
+        });
+        console.log(`Joined voice channel: ${channel.name} in guild: ${guild.name}`);
+        startListening(connection);
+      }
+    }
+  }
 });
 
-// Re-join if kicked, or on startup
+client.on('messageCreate', async message => {
+  if (!message.content.startsWith('!clip')) return;
+
+  const mention = message.mentions.users.first();
+
+  console.log('Received !clip command. Mention:', mention ? mention.tag : 'none');
+
+  if (mention) {
+    const buffer = userBuffers.get(mention.id);
+    if (!buffer || buffer.length === 0) {
+      console.log(`No audio buffered for user ${mention.tag}`);
+      return message.reply(`No audio buffered for ${mention.username}.`);
+    }
+    console.log(`Buffer chunks for ${mention.username}: ${buffer.length}`);
+    await sendWavFromBuffer(message, buffer, mention.username);
+  } else {
+    if (userBuffers.size === 0) {
+      console.log('No audio buffered for anyone');
+      return message.reply('No audio buffered for anyone.');
+    }
+
+    const allBuffers = Array.from(userBuffers.values());
+    console.log(`Mixing audio from ${allBuffers.length} users`);
+
+    // Log each buffer length
+    allBuffers.forEach((bufArr, i) => {
+      const totalLength = Buffer.concat(bufArr).length;
+      console.log(`User ${i} buffer length: ${totalLength} bytes`);
+    });
+
+    const mixedBuffer = mixBuffers(allBuffers);
+
+    if (!mixedBuffer) {
+      console.log('Failed to mix audio buffer');
+      return message.reply('Failed to mix audio.');
+    }
+
+    console.log(`Mixed buffer length: ${mixedBuffer.length}`);
+
+    await sendWavFromMixedBuffer(message, mixedBuffer);
+  }
+});
+
+
 client.on('voiceStateUpdate', (oldState, newState) => {
-    if (oldState.member.user.id === client.user.id && oldState.channel && !newState.channel) {
-        console.log(`Kicked from ${oldState.channel.name}, attempting to rejoin...`);
-        // Clean up old connection data before rejoining
-        if (voiceConnections.has(oldState.guild.id)) voiceConnections.delete(oldState.guild.id);
-        if (audioBuffers.has(oldState.guild.id)) audioBuffers.delete(oldState.guild.id);
-        autoJoinVC(oldState.guild);
-    }
+  const connection = getVoiceConnection(newState.guild.id);
+  if (connection) {
+    startListening(connection);
+  }
 });
 
+function ffmpegTimeout(ffmpegProcess, timeoutMs = 10000) {
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      ffmpegProcess.kill('SIGKILL');
+      reject(new Error('ffmpeg process timed out'));
+    }, timeoutMs);
 
-async function autoJoinVC(specificGuild = null) {
-    const guildsToJoin = specificGuild ? [specificGuild] : Array.from(client.guilds.cache.values());
-
-    for (const guild of guildsToJoin) {
-        if (voiceConnections.has(guild.id)) continue;
-
-        let targetChannel = null;
-        let maxMembers = 0;
-
-        const channels = guild.channels.cache.filter(c => c.type === ChannelType.GuildVoice);
-
-        for (const channel of channels.values()) {
-            if (channel.members.some(member => member.user.bot)) continue;
-            if (channel.members.size > maxMembers) {
-                maxMembers = channel.members.size;
-                targetChannel = channel;
-            }
-        }
-
-        if (targetChannel) {
-            try {
-                const connection = joinVoiceChannel({
-                    channelId: targetChannel.id,
-                    guildId: guild.id,
-                    adapterCreator: guild.voiceAdapterCreator,
-                    selfDeaf: false, // Must be false to receive audio
-                });
-
-                voiceConnections.set(guild.id, connection);
-                startListening(connection, guild.id);
-                console.log(`Joined '${targetChannel.name}' in '${guild.name}' and started listening.`);
-            } catch (error) {
-                console.error(`Error joining ${targetChannel.name}:`, error);
-            }
-        }
-    }
+    ffmpegProcess.on('close', (code) => {
+      clearTimeout(timeout);
+      if (code === 0) resolve();
+      else reject(new Error(`ffmpeg exited with code ${code}`));
+    });
+  });
 }
 
-// Replace your old startListening function with this one
-function startListening(connection, guildId) {
-    const bufferSize = MAX_CLIP_DURATION * AUDIO_PACKETS_PER_SECOND;
-    const audioBuffer = [];
-    audioBuffers.set(guildId, audioBuffer);
-
-    // Create a single, shared decoder
-    const decoder = new prism.opus.Decoder({ frameSize: 960, channels: 2, rate: 48000, fec: true });
-
-    // When anyone starts speaking, pipe their audio into the shared decoder
-    connection.receiver.speaking.on('start', (userId) => {
-        const opusStream = connection.receiver.subscribe(userId, {
-    end: { behavior: EndBehaviorType.AfterSilence, duration: 1000 }, // Changed to 1 second
-});
-
-        // Pipe the user's audio into the decoder, but don't let it close the decoder
-        opusStream.pipe(decoder, { end: false });
-    });
-
-    // When the shared decoder produces a PCM chunk, add it to our buffer
-    decoder.on('data', (chunk) => {
-        audioBuffer.push(chunk);
-        if (audioBuffer.length > bufferSize) {
-            audioBuffer.shift();
-        }
-    });
-
-    // Handle potential errors on the decoder
-    decoder.on('error', (err) => {
-        console.error('Decoder Error:', err);
-    });
-}
-
-
-client.on('interactionCreate', async (interaction) => {
-    if (!interaction.isChatInputCommand()) return;
-    if (!interaction.inGuild()) {
-        return interaction.reply({ content: 'These commands only work in a server.', ephemeral: true });
-    }
-
-    const { commandName } = interaction;
-    const guildId = interaction.guildId;
-
-    if (commandName === 'clip') {
-        if (!voiceConnections.has(guildId)) {
-            return interaction.reply({ content: "I'm not listening in a voice channel.", ephemeral: true });
-        }
-
-        await interaction.deferReply({ ephemeral: true });
-        const seconds = interaction.options.getInteger('seconds') ?? DEFAULT_CLIP_DURATION;
-        const buffer = audioBuffers.get(guildId);
-
-        if (!buffer || buffer.length === 0) {
-            return interaction.followUp({ content: 'Not enough audio has been recorded yet.' });
-        }
-
-        const packetsToGet = seconds * AUDIO_PACKETS_PER_SECOND;
-        const clippedAudio = buffer.slice(-packetsToGet);
-
-        const timestamp = Date.now();
-        const filePath = `clip_${interaction.user.id}_${timestamp}.wav`;
-
-        const writer = new wav.Writer({
-            sampleRate: AUDIO_SAMPLE_RATE,
-            channels: 2,
-            bitDepth: 16,
-        });
-        const fileStream = fs.createWriteStream(filePath);
-        writer.pipe(fileStream);
-        clippedAudio.forEach(chunk => writer.write(chunk));
-        writer.end();
-
-        fileStream.on('finish', async () => {
-            try {
-                await interaction.user.send({
-                    content: `Here is your clip of the last ${seconds} seconds:`,
-                    files: [filePath],
-                });
-                await interaction.followUp('✅ Clip sent to your DMs!');
-                lastClips.set(interaction.user.id, filePath);
-            } catch (error) {
-                await interaction.followUp("I couldn't send you a DM. Please check your privacy settings.");
-                fs.unlinkSync(filePath); // Clean up if DM fails
-            }
-        });
-    } else if (commandName === 'replay') {
-        const filePath = lastClips.get(interaction.user.id);
-        if (!filePath) {
-            return interaction.reply({ content: "You don't have a clip to replay.", ephemeral: true });
-        }
-        if (!fs.existsSync(filePath)) {
-            return interaction.reply({ content: "I can't find that clip file anymore.", ephemeral: true });
-        }
-        const connection = voiceConnections.get(guildId);
-        if (!connection) {
-            return interaction.reply({ content: "I'm not in a voice channel.", ephemeral: true });
-        }
-
-        const player = createAudioPlayer();
-        const resource = createAudioResource(filePath);
-        connection.subscribe(player);
-        player.play(resource);
-        await interaction.reply({ content: `▶️ Replaying your last saved audio.`, ephemeral: true });
-    }
-    // Recording commands would be added here
-});
-
-
-client.login(process.env.DISCORD_BOT_TOKEN);
+client.login(process.env.DISCORD_TOKEN);

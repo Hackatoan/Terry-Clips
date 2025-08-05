@@ -24,3 +24,5 @@ build/
 
 # IDE files
 .vscode/
+
+google-key.json

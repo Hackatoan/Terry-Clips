@@ -1,5 +1,3 @@
-// This file is the entry point of the Discord bot. It initializes the bot using the token from the .env file, connects to Discord, and implements the logic to join the voice channel with the most members.
-
 require('dotenv').config();
 const { Client, GatewayIntentBits } = require('discord.js');
 const { getLargestVoiceChannel } = require('./utils/channelHelper');
@@ -8,17 +6,6 @@ const { Writable } = require('stream');
 const fs = require('fs');
 const path = require('path');
 const prism = require('prism-media');
-const speech = require('@google-cloud/speech');
-const speechClient = new speech.SpeechClient();
-
-const client = new Client({
-    intents: [
-        GatewayIntentBits.Guilds,
-        GatewayIntentBits.GuildVoiceStates,
-        GatewayIntentBits.GuildMessages,
-        GatewayIntentBits.MessageContent,
-    ],
-});
 
 const AUDIO_BUFFER_DURATION = 30 * 1000; // 30 seconds in ms
 
@@ -39,6 +26,15 @@ function addToBuffer(userId, chunk) {
 
 // Track active audio streams per user
 const activeAudioStreams = new Map();
+
+const client = new Client({
+    intents: [
+        GatewayIntentBits.Guilds,
+        GatewayIntentBits.GuildVoiceStates,
+        GatewayIntentBits.GuildMessages,
+        GatewayIntentBits.MessageContent,
+    ],
+});
 
 client.once('ready', async () => {
     console.log(`Logged in as ${client.user.tag}`);
@@ -92,23 +88,13 @@ client.once('ready', async () => {
                 activeAudioStreams.set(userId, audioStream);
             });
 
-            receiver.speaking.on('end', async (userId) => {
+            receiver.speaking.on('end', (userId) => {
                 const audioStream = activeAudioStreams.get(userId);
                 if (audioStream) {
                     audioStream.removeAllListeners('data');
                     audioStream.removeAllListeners('end');
                     audioStream.destroy();
                     activeAudioStreams.delete(userId);
-                }
-                // Get user's last 30s buffer
-                const bufferArr = userAudioBuffers.get(userId);
-                if (bufferArr && bufferArr.length > 0) {
-                    const userPcmBuffer = Buffer.concat(bufferArr.map(entry => entry.chunk));
-                    const transcript = await transcribePcmBufferGoogle(userPcmBuffer);
-                    if (transcript && /\bterry\s+clip\s+that\b/i.test(transcript)) {
-                        console.log('Voice trigger: sending to channel', 1402078598147342336);
-                        runClipCommand(1402078598147342336);
-                    }
                 }
             });
         } catch (error) {
@@ -167,117 +153,48 @@ function normalizePcmBuffer(pcmBuffer) {
     return normalized;
 }
 
-async function transcribePcmBufferGoogle(pcmBuffer) {
-    const audioBytes = pcmBuffer.toString('base64');
-    const request = {
-        audio: { content: audioBytes },
-        config: {
-            encoding: 'LINEAR16',
-            sampleRateHertz: 48000,
-            languageCode: 'en-US',
-            audioChannelCount: 1,
-        },
-    };
-    const [response] = await speechClient.recognize(request);
-    const transcription = response.results
-        .map(result => result.alternatives[0].transcript)
-        .join(' ');
-    return transcription;
-}
-
 client.on('messageCreate', async (message) => {
-    // Regex to match "terry clip that" with any spelling of "terry"
-    const terryRegex = /\b[tT][eEaA3][rR][rR][yYi1lL!|]\s+clip\s+that\b/i;
-
-    const shouldClip =
-        message.content === '!clip' ||
-        terryRegex.test(message.content);
-
-    if (!shouldClip) return;
-
-    let allEntries = [];
-    for (const bufferArr of userAudioBuffers.values()) {
-        for (const entry of bufferArr) {
-            allEntries.push(entry);
+    if (message.content === '!clip') {
+        let allEntries = [];
+        for (const bufferArr of userAudioBuffers.values()) {
+            for (const entry of bufferArr) {
+                allEntries.push(entry);
+            }
         }
-    }
-    if (allEntries.length === 0) {
-        await message.reply('No audio captured in the last 30 seconds.');
-        return;
-    }
-    allEntries.sort((a, b) => a.timestamp - b.timestamp);
-
-    const pcmBuffer = Buffer.concat(allEntries.map(entry => entry.chunk));
-    const normalizedBuffer = normalizePcmBuffer(pcmBuffer);
-
-    const wavHeader = createWavHeader(normalizedBuffer.length, {
-        numChannels: 1,
-        sampleRate: 48000,
-        bitDepth: 16,
-    });
-    const wavBuffer = Buffer.concat([wavHeader, normalizedBuffer]);
-    const filePath = path.join(__dirname, 'clip.wav');
-    fs.writeFileSync(filePath, wavBuffer);
-
-    await message.channel.send({
-        files: [{
-            attachment: filePath,
-            name: 'clip.wav'
-        }]
-    });
-
-    fs.unlinkSync(filePath);
-});
-
-async function runClipCommand(channelId) {
-    console.log('runClipCommand called with:', channelId);
-    let channel = client.channels.cache.get(channelId);
-    if (!channel) {
-        // Try to fetch the channel if not cached
-        try {
-            console.log('Trying to fetch channel:', channelId);
-            channel = await client.channels.fetch(channelId);
-        } catch (err) {
-            console.error('Could not fetch channel:', channelId, err);
+        if (allEntries.length === 0) {
+            await message.reply('No audio captured in the last 30 seconds.');
             return;
         }
+        allEntries.sort((a, b) => a.timestamp - b.timestamp);
+
+        // Concatenate all chunks in time order
+        const pcmBuffer = Buffer.concat(allEntries.map(entry => entry.chunk));
+
+        // Normalize the entire buffer (not per chunk)
+        const normalizedBuffer = normalizePcmBuffer(pcmBuffer);
+
+        const wavHeader = createWavHeader(normalizedBuffer.length, {
+            numChannels: 1,
+            sampleRate: 48000,
+            bitDepth: 16,
+        });
+        const wavBuffer = Buffer.concat([wavHeader, normalizedBuffer]);
+        const filePath = path.join(__dirname, 'clip.wav');
+        fs.writeFileSync(filePath, wavBuffer);
+
+        await message.channel.send({
+            files: [{
+                attachment: filePath,
+                name: 'clip.wav'
+            }]
+        });
+
+        fs.unlinkSync(filePath);
     }
-    console.log('Resolved channel:', channel?.name, channel?.id, channel?.type);
+});
 
-    let allEntries = [];
-    for (const bufferArr of userAudioBuffers.values()) {
-        for (const entry of bufferArr) {
-            allEntries.push(entry);
-        }
-    }
-    if (allEntries.length === 0) {
-        await channel.send('No audio captured in the last 30 seconds.');
-        return;
-    }
-    allEntries.sort((a, b) => a.timestamp - b.timestamp);
-
-    const pcmBuffer = Buffer.concat(allEntries.map(entry => entry.chunk));
-    const normalizedBuffer = normalizePcmBuffer(pcmBuffer);
-
-    const wavHeader = createWavHeader(normalizedBuffer.length, {
-        numChannels: 1,
-        sampleRate: 48000,
-        bitDepth: 16,
-    });
-    const wavBuffer = Buffer.concat([wavHeader, normalizedBuffer]);
-    const filePath = path.join(__dirname, 'clip.wav');
-    fs.writeFileSync(filePath, wavBuffer);
-
-    await channel.send({
-        files: [{
-            attachment: filePath,
-            name: 'clip.wav'
-        }]
-    });
-
-    fs.unlinkSync(filePath);
-}
+// Add this intent to your client if not present
+// GatewayIntentBits.MessageContent,
+// GatewayIntentBits.GuildMessages,
 
 client.login(process.env.BOT_TOKEN);
-
-console.log('Bot starting, hardcoded channel:', 1402078598147342336);
